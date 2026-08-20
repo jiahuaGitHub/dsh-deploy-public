@@ -10,7 +10,7 @@
  */
 import { type ChildProcess } from 'node:child_process';
 export declare function sleep(ms: number): Promise<void>;
-/** 短命令（node/git/gh），args 数组，无 shell —— 路径带空格也安全 */
+/** 短命令（node/git/gh），args 数组，无 shell —— 路径带空格也安全；输出缓冲上限 2MB */
 export declare function runArgs(cmd: string, args: string[], opts?: {
     cwd?: string;
     timeoutMs?: number;
@@ -29,7 +29,7 @@ export declare function waitHealthy(port: number, timeoutMs?: number): Promise<{
     ok: boolean;
     detail: string;
 }>;
-/** 从可轮询的日志读取器里等 trycloudflare URL */
+/** 从可轮询的日志读取器里等 trycloudflare URL（带边界校验，防截取到 .example 之类假域名） */
 export declare function waitTunnelUrl(getLogs: () => string, timeoutMs?: number): Promise<string | null>;
 /** 用 8.8.8.8 解析 + IP 直连（SNI/Host 带原域名），绕过本地 DNS 污染验证隧道本身 */
 export declare function directHttpsProbe(hostname: string, ip: string, pathname: string): Promise<boolean>;
@@ -40,19 +40,23 @@ export declare function verifyPublic(url: string): Promise<{
     directOk?: boolean;
     ip?: string;
 }>;
-export declare const GH_TOKEN_FILE: string;
-export interface DeviceFlowHandle {
+export interface DeviceFlow {
     userCode: string;
     verifyUrl: string;
+    deviceCode: string;
+    interval: number;
+    expiresIn: number;
+    tokenFile: string;
+    flowDir: string;
     promise: Promise<'ok' | 'expired' | 'error'>;
 }
-/** 发起设备流并返回句柄；轮询在进程内后台进行（插件/CLI 共用）。token 写 TOKEN_FILE。 */
-export declare function startDeviceFlow(): DeviceFlowHandle | {
+/** 第一步：申请设备码（await 完成才返回，码必非空）。 */
+export declare function requestDeviceCode(): Promise<DeviceFlow | {
     error: string;
-};
+}>;
 export declare function ghAuthed(): Promise<boolean>;
-/** 从临时文件取 token → 喂给 gh（stdin，不打印）→ 成功才删除文件 */
-export declare function finishGhAuth(): Promise<{
+/** 从 flow 的私有 token 文件取 token → 喂给 gh（stdin，不打印）→ 成功即清理 flow 目录 */
+export declare function finishGhAuth(flow: DeviceFlow): Promise<{
     ok: boolean;
     detail: string;
 }>;
@@ -63,7 +67,14 @@ export declare function ensureGhAuthBlocking(): Promise<{
     userCode?: string;
     verifyUrl?: string;
 }>;
-export declare function publishToGithub(projectDir: string, repoName: string, startCommand: string | undefined): Promise<Record<string, unknown>>;
+export interface PublishOptions {
+    repoName: string;
+    startCommand?: string;
+    includeDist?: boolean;
+    allowExistingRemote?: boolean;
+    visibility?: 'public' | 'private';
+}
+export declare function publishToGithub(projectDir: string, opts: PublishOptions): Promise<Record<string, unknown>>;
 export declare const STATE_DIR: string;
 export declare const STATE_FILE: string;
 export interface DeployState {

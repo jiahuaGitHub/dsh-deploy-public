@@ -11,7 +11,7 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import dns from 'node:dns'
 import https from 'node:https'
-import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, appendFileSync, openSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, appendFileSync, readdirSync, statSync, mkdtempSync, chmodSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import os from 'node:os'
 import path from 'node:path'
@@ -21,20 +21,31 @@ import path from 'node:path'
 // ---------------------------------------------------------------------------
 export function sleep(ms: number): Promise<void> { return new Promise((r) => setTimeout(r, ms)) }
 
-/** 短命令（node/git/gh），args 数组，无 shell —— 路径带空格也安全 */
+/** 短命令（node/git/gh），args 数组，无 shell —— 路径带空格也安全；输出缓冲上限 2MB */
 export function runArgs(cmd: string, args: string[], opts: { cwd?: string; timeoutMs?: number; input?: string } = {}): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     const child = spawn(cmd, args, { cwd: opts.cwd, env: { ...process.env }, windowsHide: true })
     let out = '', err = ''
-    child.stdout?.on('data', (d) => { out += d })
-    child.stderr?.on('data', (d) => { err += d })
+    let truncated = false
+    const push = (buf: string, target: 'out' | 'err') => {
+      if (target === 'out') { out += buf; if (out.length > 2_000_000) { out = out.slice(0, 2_000_000); truncated = true } }
+      else { err += buf; if (err.length > 2_000_000) { err = err.slice(0, 2_000_000); truncated = true } }
+    }
+    child.stdout?.on('data', (d) => push(String(d), 'out'))
+    child.stderr?.on('data', (d) => push(String(d), 'err'))
     if (opts.input !== undefined) {
       child.stdin.on('error', () => {})
       child.stdin.write(opts.input)
       child.stdin.end()
     }
-    const t = opts.timeoutMs ? setTimeout(() => { try { child.kill() } catch { /* noop */ } }, opts.timeoutMs) : undefined
-    child.on('close', (code) => { if (t) clearTimeout(t); resolve({ code, stdout: out, stderr: err }) })
+    const t = opts.timeoutMs ? setTimeout(() => {
+      // 超时：杀整棵树（Windows taskkill /T；POSIX 进程组）
+      try {
+        if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true })
+        else { try { process.kill(-child.pid!, 'SIGTERM') } catch { child.kill('SIGTERM') } }
+      } catch { /* noop */ }
+    }, opts.timeoutMs) : undefined
+    child.on('close', (code) => { if (t) clearTimeout(t); resolve({ code, stdout: truncated ? out + '\n[truncated]' : out, stderr: err }) })
     child.on('error', (e) => { if (t) clearTimeout(t); resolve({ code: -1, stdout: out, stderr: String(e) }) })
   })
 }
@@ -69,19 +80,20 @@ export async function waitHealthy(port: number, timeoutMs = 40_000): Promise<{ o
     for (const p of paths) {
       try {
         const r = await fetch(base + p, { signal: AbortSignal.timeout(4000) })
-        if (r.status < 500) return { ok: true, detail: `${p} -> ${r.status}` }
+        // 只认 2xx：401/404 等说明端口上跑的不是本项目，可能是别的服务（防误暴露）
+        if (r.status >= 200 && r.status < 300) return { ok: true, detail: `${p} -> ${r.status}` }
       } catch { /* keep polling */ }
     }
     await sleep(1500)
   }
-  return { ok: false, detail: 'no route answered within timeout' }
+  return { ok: false, detail: 'no 2xx route answered within timeout (端口上可能是别的服务，已拒绝暴露)' }
 }
 
-/** 从可轮询的日志读取器里等 trycloudflare URL */
+/** 从可轮询的日志读取器里等 trycloudflare URL（带边界校验，防截取到 .example 之类假域名） */
 export async function waitTunnelUrl(getLogs: () => string, timeoutMs = 45_000): Promise<string | null> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    const m = getLogs().match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/)
+    const m = getLogs().match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com(?![\w.-])/)
     if (m) return m[0]
     await sleep(1000)
   }
@@ -123,12 +135,17 @@ export async function verifyPublic(url: string): Promise<{ ok: boolean; detail: 
     const u = new URL(url)
     const resolver = new dns.promises.Resolver()
     resolver.setServers(['8.8.8.8'])
-    const addr = await resolver.resolve4(u.hostname)
+    // 给 DNS 解析加总超时（默认无超时，防挂死）
+    const addr = await Promise.race([
+      resolver.resolve4(u.hostname),
+      new Promise<never>((_, rej) => setTimeout(() => rej(new Error('DNS resolve timeout')), 8000)),
+    ])
     const ip = addr[0]
     const ok = await directHttpsProbe(u.hostname, ip, u.pathname)
     return {
       ok,
-      detail: `本地 DNS 失败(${lastErr?.cause ? String((lastErr.cause as { code?: string }).code) : lastErr?.message})；8.8.8.8 直连验证 ${ok ? '正常' : '失败'}@${ip}`,
+      // 语义：这只是「本机探测」，不证明公网 DNS 可达（本机 DNS 可能被劫持/过滤）
+      detail: `本地 DNS 失败(${lastErr?.cause ? String((lastErr.cause as { code?: string }).code) : lastErr?.message})；8.8.8.8 直连探测 ${ok ? '正常' : '失败'}@${ip}`,
       directOk: ok,
       ip,
     }
@@ -139,10 +156,44 @@ export async function verifyPublic(url: string): Promise<{ ok: boolean; detail: 
 
 // ---------------------------------------------------------------------------
 // GitHub 设备流（Node 实现，绕开 gh 的 Go 网络栈；token 只写临时文件，不经模型）
+// 设计要点（按 Codex 审查修复）：
+//  - requestDeviceCode() 先 await 拿到 device_code/user_code 才返回，杜绝空码
+//  - 每个 flow 用独立随机临时目录 + 私有 token 文件，互不覆盖；启动时清扫残留
+//  - scope 最小化：repo + read:org（gh 校验硬性要求 read:org，workflow/gist 不需要）
 // ---------------------------------------------------------------------------
-const TOKEN_FILE = path.join(os.tmpdir(), 'dsh-deploy-gh-token.tmp')
-export const GH_TOKEN_FILE = TOKEN_FILE
+const GH_CLIENT_ID = '178c6fc778ccc68e1d6a' // gh CLI 公开 client id
 const POLL_LOG = path.join(os.tmpdir(), 'dsh-deploy-gh-poll.log')
+
+// 启动时清扫残留的旧 flow 目录（>2h 删除）
+{
+  const base = path.join(os.tmpdir())
+  try {
+    for (const name of readdirSyncSafe(base)) {
+      if (name.startsWith('dsh-deploy-gh-flow-')) {
+        const p = path.join(base, name)
+        try {
+          const age = Date.now() - statSync(p).mtimeMs
+          if (age > 2 * 3600 * 1000) rmSync(p, { recursive: true, force: true })
+        } catch { /* noop */ }
+      }
+    }
+  } catch { /* noop */ }
+}
+
+function readdirSyncSafe(dir: string): string[] {
+  try { return readdirSync(dir) } catch { return [] }
+}
+
+export interface DeviceFlow {
+  userCode: string
+  verifyUrl: string
+  deviceCode: string
+  interval: number
+  expiresIn: number
+  tokenFile: string
+  flowDir: string
+  promise: Promise<'ok' | 'expired' | 'error'>
+}
 
 async function ghPost(url: string, params: Record<string, string>): Promise<Record<string, string>> {
   const r = await fetch(url, {
@@ -162,40 +213,48 @@ async function ghPostRetry(url: string, params: Record<string, string>): Promise
   throw last
 }
 
-export interface DeviceFlowHandle {
-  userCode: string
-  verifyUrl: string
-  promise: Promise<'ok' | 'expired' | 'error'>
-}
-
-/** 发起设备流并返回句柄；轮询在进程内后台进行（插件/CLI 共用）。token 写 TOKEN_FILE。 */
-export function startDeviceFlow(): DeviceFlowHandle | { error: string } {
-  const handle: DeviceFlowHandle = { userCode: '', verifyUrl: '', promise: Promise.resolve('error') }
-  const promise = (async (): Promise<'ok' | 'expired' | 'error'> => {
-    try {
-      const d = await ghPostRetry('https://github.com/login/device/code', {
-        client_id: '178c6fc778ccc68e1d6a', // gh CLI 公开 client id
-        scope: 'repo,read:org,workflow,gist',
-      })
-      if (!d.device_code) return 'error'
-      handle.userCode = d.user_code
-      handle.verifyUrl = d.verification_uri
-      const deadline = Date.now() + Number(d.expires_in || 900) * 1000
+/** 第一步：申请设备码（await 完成才返回，码必非空）。 */
+export async function requestDeviceCode(): Promise<DeviceFlow | { error: string }> {
+  try {
+    const d = await ghPostRetry('https://github.com/login/device/code', {
+      client_id: GH_CLIENT_ID,
+      scope: 'repo,read:org',
+    })
+    if (!d.device_code || !d.user_code || !d.verification_uri) {
+      return { error: `设备码响应不完整: ${JSON.stringify(d).slice(0, 200)}` }
+    }
+    const flowDir = mkdtempSync(path.join(os.tmpdir(), 'dsh-deploy-gh-flow-'))
+    const tokenFile = path.join(flowDir, 'token')
+    try { chmodSync(tokenFile, 0o600) } catch { /* Windows 无意义 */ }
+    const flow: DeviceFlow = {
+      userCode: d.user_code,
+      verifyUrl: d.verification_uri,
+      deviceCode: d.device_code,
+      interval: Number(d.interval) || 5,
+      expiresIn: Number(d.expires_in) || 900,
+      tokenFile,
+      flowDir,
+      promise: Promise.resolve('error'),
+    }
+    flow.promise = (async (): Promise<'ok' | 'expired' | 'error'> => {
+      const deadline = Date.now() + flow.expiresIn * 1000
       let n = 0
       while (Date.now() < deadline) {
-        await sleep((Number(d.interval) || 5) * 1000)
+        await sleep(flow.interval * 1000)
         n++
         let t: Record<string, string>
         try {
           t = await ghPostRetry('https://github.com/login/oauth/access_token', {
-            client_id: '178c6fc778ccc68e1d6a',
-            device_code: d.device_code,
+            client_id: GH_CLIENT_ID,
+            device_code: flow.deviceCode,
             grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
           })
         } catch { appendLog('poll ' + n + ' hard-fail, continuing'); continue }
         if (t.access_token) {
-          writeFileSync(TOKEN_FILE, t.access_token, 'utf8')
-          appendLog('TOKEN_OBTAINED')
+          try {
+            writeFileSync(flow.tokenFile, t.access_token, { encoding: 'utf8', mode: 0o600 })
+            appendLog('TOKEN_OBTAINED')
+          } catch (e) { appendLog('token write failed: ' + (e as Error).message); return 'error' }
           return 'ok'
         }
         if (t.error === 'authorization_pending') { appendLog('poll ' + n + ': waiting for user...'); continue }
@@ -204,13 +263,12 @@ export function startDeviceFlow(): DeviceFlowHandle | { error: string } {
         return 'error'
       }
       return 'expired'
-    } catch (e) {
-      appendLog('FATAL: ' + (e as Error).message)
-      return 'error'
-    }
-  })()
-  handle.promise = promise
-  return handle
+    })()
+    return flow
+  } catch (e) {
+    appendLog('FATAL: ' + (e as Error).message)
+    return { error: `申请设备码失败: ${(e as Error).message}` }
+  }
 }
 
 function appendLog(msg: string): void {
@@ -222,28 +280,29 @@ export async function ghAuthed(): Promise<boolean> {
   return r.code === 0
 }
 
-/** 从临时文件取 token → 喂给 gh（stdin，不打印）→ 成功才删除文件 */
-export async function finishGhAuth(): Promise<{ ok: boolean; detail: string }> {
-  if (!existsSync(TOKEN_FILE)) return { ok: false, detail: 'no token yet' }
-  const token = readFileSync(TOKEN_FILE, 'utf8').trim()
+/** 从 flow 的私有 token 文件取 token → 喂给 gh（stdin，不打印）→ 成功即清理 flow 目录 */
+export async function finishGhAuth(flow: DeviceFlow): Promise<{ ok: boolean; detail: string }> {
+  if (!existsSync(flow.tokenFile)) return { ok: false, detail: 'no token yet' }
+  const token = readFileSync(flow.tokenFile, 'utf8').trim()
   if (!token) return { ok: false, detail: 'empty token' }
   const r = await runArgs('gh', ['auth', 'login', '--with-token'], { input: token, timeoutMs: 60_000 })
-  if (r.code === 0) {
-    try { rmSync(TOKEN_FILE) } catch { /* noop */ }
-    return { ok: true, detail: 'gh authenticated' }
-  }
+  try { rmSync(flow.flowDir, { recursive: true, force: true }) } catch { /* noop */ }
+  if (r.code === 0) return { ok: true, detail: 'gh authenticated' }
   return { ok: false, detail: `gh rejected token: ${(r.stderr || r.stdout).trim().slice(0, 400)}` }
 }
 
 /** 确保 gh 已认证；未认证则发起设备流并阻塞等待用户授权（CLI 用） */
 export async function ensureGhAuthBlocking(): Promise<{ ok: boolean; detail: string; userCode?: string; verifyUrl?: string }> {
   if (await ghAuthed()) return { ok: true, detail: 'gh already authenticated' }
-  const handle = startDeviceFlow()
-  if ('error' in handle) return { ok: false, detail: handle.error }
-  process.stdout.write(`\n>>> 请打开 ${handle.verifyUrl} 输入设备码 ${handle.userCode} 并点击 Authorize（15 分钟内有效）...\n`)
-  const status = await handle.promise
-  if (status !== 'ok') return { ok: false, detail: `设备流未完成: ${status}` }
-  const fin = await finishGhAuth()
+  const flow = await requestDeviceCode()
+  if ('error' in flow) return { ok: false, detail: flow.error }
+  process.stdout.write(`\n>>> 请打开 ${flow.verifyUrl} 输入设备码 ${flow.userCode} 并点击 Authorize（15 分钟内有效）...\n`)
+  const status = await flow.promise
+  if (status !== 'ok') {
+    try { rmSync(flow.flowDir, { recursive: true, force: true }) } catch { /* noop */ }
+    return { ok: false, detail: `设备流未完成: ${status}` }
+  }
+  const fin = await finishGhAuth(flow)
   if (!fin.ok) return { ok: false, detail: fin.detail }
   return { ok: true, detail: 'gh authenticated' }
 }
@@ -251,7 +310,38 @@ export async function ensureGhAuthBlocking(): Promise<{ ok: boolean; detail: str
 // ---------------------------------------------------------------------------
 // permanent：建仓 + 提交 + 推送 + render.yaml
 // ---------------------------------------------------------------------------
-export async function publishToGithub(projectDir: string, repoName: string, startCommand: string | undefined): Promise<Record<string, unknown>> {
+/** 常见秘密文件模式（git add 后自动撤出暂存区，避免公开仓库泄密） */
+const SECRET_PATTERNS: Array<{ test: (p: string) => boolean; label: string }> = [
+  { test: (p) => /(^|\/)(\.env|\.env\..*)(\.|$)/i.test(p), label: '.env*' },
+  { test: (p) => /\.(pem|key|p12|pfx|keystore|jks|der)$/i.test(p), label: '私钥/证书' },
+  { test: (p) => /(^|\/)(id_rsa|id_ed25519|id_ecdsa|credentials?\.(json|txt)|secrets?\.(json|ya?ml|txt)|\.netrc|\.npmrc|\.pypirc)(\.|$)/i.test(p), label: '凭据文件' },
+  { test: (p) => /\.(sql|dump|bak)$/i.test(p) && /(db|database|backup)/i.test(p), label: '数据库导出/备份' },
+]
+
+export interface PublishOptions {
+  repoName: string
+  startCommand?: string
+  includeDist?: boolean
+  allowExistingRemote?: boolean
+  visibility?: 'public' | 'private'
+}
+
+/** 从暂存区撤出匹配秘密模式的文件；返回被拦截清单 */
+async function unstageSecrets(projectDir: string): Promise<string[]> {
+  const staged = await runArgs('git', ['-C', projectDir, 'diff', '--cached', '--name-only'], { timeoutMs: 15_000 })
+  if (staged.code !== 0) return []
+  const blocked: string[] = []
+  for (const line of staged.stdout.split('\n').map((s) => s.trim()).filter(Boolean)) {
+    if (SECRET_PATTERNS.some((p) => p.test(line))) {
+      await runArgs('git', ['-C', projectDir, 'reset', '-q', '--', line], { timeoutMs: 15_000 })
+      blocked.push(line)
+    }
+  }
+  return blocked
+}
+
+export async function publishToGithub(projectDir: string, opts: PublishOptions): Promise<Record<string, unknown>> {
+  const { repoName, startCommand, includeDist = false, allowExistingRemote = false, visibility = 'public' } = opts
   const isRepo = await runArgs('git', ['-C', projectDir, 'rev-parse', '--is-inside-work-tree'], { timeoutMs: 15_000 })
   if (isRepo.code !== 0) {
     const init = await runArgs('git', ['init', '-b', 'main'], { cwd: projectDir, timeoutMs: 15_000 })
@@ -262,36 +352,21 @@ export async function publishToGithub(projectDir: string, repoName: string, star
   const hasEmail = await runArgs('git', ['-C', projectDir, 'config', 'user.email'], { timeoutMs: 10_000 })
   if (hasEmail.code !== 0) await runArgs('git', ['-C', projectDir, 'config', 'user.email', 'dsh-deploy@users.noreply.github.com'], { timeoutMs: 10_000 })
 
-  const distDir = path.join(projectDir, 'dist')
-  if (existsSync(distDir)) {
-    const ignored = await runArgs('git', ['-C', projectDir, 'check-ignore', 'dist/'], { timeoutMs: 10_000 })
-    if (ignored.code === 0) await runArgs('git', ['-C', projectDir, 'add', '-f', 'dist/'], { timeoutMs: 30_000 })
-  }
-  await runArgs('git', ['-C', projectDir, 'add', '-A'], { timeoutMs: 30_000 })
-  await runArgs('git', ['-C', projectDir, 'commit', '--allow-empty', '-m', 'deploy: auto publish to public web'], { timeoutMs: 30_000 })
-
+  // 0) 已有 origin 守卫：防止推送到未知/既有远端
   const remote = await runArgs('git', ['-C', projectDir, 'remote', 'get-url', 'origin'], { timeoutMs: 10_000 })
-  if (remote.code !== 0) {
-    const created = await runArgs('gh', ['repo', 'create', repoName, '--public', '--source', projectDir, '--description', 'Auto-deployed via dsh-deploy-public'], { timeoutMs: 60_000 })
-    if (created.code !== 0 && !/already exists/i.test(created.stderr)) {
-      return { status: 'error', step: 'gh repo create', detail: created.stderr.trim() || created.stdout.trim() }
+  if (remote.code === 0 && !allowExistingRemote) {
+    return {
+      status: 'error', step: 'existing-remote',
+      detail: `项目已有 origin（${remote.stdout.trim()}）。为防误推，默认拒绝：确认后加 --push-existing（CLI）/ allow_existing_remote=true（工具）。`,
     }
   }
 
-  let pushDetail = ''
-  for (let i = 1; i <= 5; i++) {
-    const p = await runArgs('git', ['-C', projectDir, 'push', '-u', 'origin', 'HEAD'], { timeoutMs: 90_000 })
-    if (p.code === 0) { pushDetail = `pushed on attempt ${i}`; break }
-    pushDetail = `attempt ${i} failed: ${p.stderr.trim().split('\n').slice(-2).join(' ')}`
-    await sleep(3000 * i)
-  }
-  if (!pushDetail.startsWith('pushed')) return { status: 'error', step: 'git push', detail: pushDetail }
-
+  // 1) render.yaml 前置生成（缺则生成；已存在则尊重项目自带）
   const renderFile = path.join(projectDir, 'render.yaml')
   if (!existsSync(renderFile)) {
     const cmd = startCommand ?? 'node dist/src/apps/api/server.js'
     writeFileSync(renderFile, [
-      '# Render Blueprint — auto-generated by dsh-deploy-public',
+      '# Render Blueprint — auto-generated by dsh-deploy-public（项目可自行提供并覆盖）',
       'services:',
       '  - type: web',
       '    name: ' + repoName,
@@ -302,6 +377,54 @@ export async function publishToGithub(projectDir: string, repoName: string, star
       '    healthCheckPath: /api/health',
     ].join('\n') + '\n', 'utf8')
   }
+
+  // 2) 纳入 dist（仅显式开启；默认尊重 .gitignore）
+  const distDir = path.join(projectDir, 'dist')
+  if (includeDist && existsSync(distDir)) {
+    const ignored = await runArgs('git', ['-C', projectDir, 'check-ignore', 'dist/'], { timeoutMs: 10_000 })
+    if (ignored.code === 0) {
+      const add = await runArgs('git', ['-C', projectDir, 'add', '-f', 'dist/'], { timeoutMs: 60_000 })
+      if (add.code !== 0) return { status: 'error', step: 'git add -f dist', detail: add.stderr.trim() }
+    }
+  }
+  const addAll = await runArgs('git', ['-C', projectDir, 'add', '-A'], { timeoutMs: 30_000 })
+  if (addAll.code !== 0) return { status: 'error', step: 'git add', detail: addAll.stderr.trim() }
+
+  // 3) 秘密文件拦截（自动撤出 + 明确报告）
+  const blocked = await unstageSecrets(projectDir)
+
+  // 4) 暂存清单（供展示/确认）
+  const stagedList = await runArgs('git', ['-C', projectDir, 'diff', '--cached', '--name-only'], { timeoutMs: 15_000 })
+  const files = stagedList.stdout.split('\n').map((s) => s.trim()).filter(Boolean)
+  const stagedSummary = { count: files.length, sample: files.slice(0, 30), blocked }
+
+  const commit = await runArgs('git', ['-C', projectDir, 'commit', '--allow-empty', '-m', 'deploy: auto publish to public web'], { timeoutMs: 30_000 })
+  if (commit.code !== 0) return { status: 'error', step: 'git commit', detail: commit.stderr.trim(), staged: stagedSummary }
+
+  // 5) 建仓（无 origin 时；已有 origin 且显式允许时沿用）
+  if (remote.code !== 0) {
+    const created = await runArgs('gh', ['repo', 'create', repoName, `--${visibility}`, '--source', projectDir, '--description', 'Auto-deployed via dsh-deploy-public'], { timeoutMs: 60_000 })
+    if (created.code !== 0 && !/already exists/i.test(created.stderr)) {
+      return { status: 'error', step: 'gh repo create', detail: created.stderr.trim() || created.stdout.trim(), staged: stagedSummary }
+    }
+    if (created.code !== 0) {
+      // 已存在：显式设置 origin（不覆盖既有业务 remote 语义由调用方保证）
+      const setRemote = await runArgs('git', ['-C', projectDir, 'remote', 'add', 'origin', `https://github.com/${repoName}.git`], { timeoutMs: 15_000 })
+      if (setRemote.code !== 0 && !/already exists/i.test(setRemote.stderr)) {
+        return { status: 'error', step: 'git remote add', detail: setRemote.stderr.trim() }
+      }
+    }
+  }
+
+  let pushDetail = ''
+  for (let i = 1; i <= 5; i++) {
+    const p = await runArgs('git', ['-C', projectDir, 'push', '-u', 'origin', 'HEAD'], { timeoutMs: 90_000 })
+    if (p.code === 0) { pushDetail = `pushed on attempt ${i}`; break }
+    pushDetail = `attempt ${i} failed: ${p.stderr.trim().split('\n').slice(-2).join(' ')}`
+    await sleep(3000 * i)
+  }
+  if (!pushDetail.startsWith('pushed')) return { status: 'error', step: 'git push', detail: pushDetail, staged: stagedSummary }
+
   let repoUrl = `https://github.com/${repoName}`
   const view = await runArgs('gh', ['repo', 'view', repoName, '--json', 'url', '--jq', '.url'], { timeoutMs: 30_000 })
   if (view.code === 0 && view.stdout.trim()) repoUrl = view.stdout.trim()
@@ -310,6 +433,8 @@ export async function publishToGithub(projectDir: string, repoName: string, star
     repo_name: repoName,
     repo_url: repoUrl,
     push: pushDetail,
+    visibility,
+    staged: stagedSummary,
     render: '在 https://render.com 登录后：New → Blueprint → 选择该仓库（render.yaml 已就位），一路 Next 即可；免费额度会因空闲休眠。',
   }
 }
@@ -391,7 +516,8 @@ export async function doctor(projectDir?: string): Promise<DoctorReport> {
   const checks: DoctorReport['checks'] = []
   const push = (name: string, pass: boolean, detail: string) => checks.push({ name, pass, detail })
 
-  push('node', process.version.startsWith('v2'), `v${process.version.slice(1)} (需要 >=20)`)
+  const major = Number(process.version.slice(1).split('.')[0]) || 0
+  push('node', major >= 18, `v${process.version.slice(1)} (需要 >=18)`)
 
   const cf = await runArgs('cloudflared', ['--version'], { timeoutMs: 10_000 })
   push('cloudflared', cf.code === 0, cf.code === 0 ? cf.stdout.trim() || cf.stderr.trim() : '未安装 → Windows: winget install Cloudflare.cloudflared')

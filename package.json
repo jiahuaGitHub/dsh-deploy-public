@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-deploy-public",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "一句话把本地项目部署到公网：自动起服务 + cloudflared 隧道/ GitHub+Render 永久部署（插件 + 独立 CLI 双形态）",
   "private": true,
   "type": "module",

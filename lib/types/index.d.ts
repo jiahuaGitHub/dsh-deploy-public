@@ -4,7 +4,7 @@
  *
  * 工具：
  *   deploy_public  一键把本地项目部署到公网（tunnel 临时链接 / permanent GitHub+Render）
- *   deploy_status  查看运行中的 server/tunnel/授权进程
+ *   deploy_status  查看运行中的 server/tunnel 进程
  *   deploy_stop    停止进程
  */
 import type { Context } from '@deepseek-ai/cordis';

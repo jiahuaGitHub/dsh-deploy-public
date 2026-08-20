@@ -16,13 +16,21 @@ When the user says "帮我把 X 部署上网 / 部署到公网 / 上线 / 给我
    - 运行 `node <临时目录>/install.mjs`（默认装进 web profile：写入 dependencies + bundles → `pnpm install` → 复制 SKILL 到 agent presets）
    - 重启 / 热重载 harness 后本技能自动生效，直接走下面的 deploy_public 流程
    - 网络不通时用 `node install.mjs --from-local <临时目录>`
-2. **独立 CLI（任何终端）**：`npm i -g <GitHub Release 的 tgz 地址>`，之后用 `dsh-deploy tunnel/permanent/doctor/status/stop`
+2. **独立 CLI（任何终端）**：从 GitHub Release 下载 tgz 后 `npm i -g ./xxx.tgz`（本包未发布到 npm registry，不要用 `npm i -g dsh-deploy-public`），之后用 `dsh-deploy tunnel/permanent/doctor/status/stop`
 3. 装完先跑 `dsh-deploy doctor`（CLI）确认环境（缺 cloudflared/gh 会给安装命令）。
+
+## 安全与参数要点（转达给用户/自行遵守）
+
+- permanent 默认创建**公开**仓库：CLI 交互式会二次确认（非交互必须 `--yes`）；插件工具默认 public，如用户要求私有传 `visibility: "private"`
+- 敏感文件（`.env*`、私钥、凭据等）会被自动拦截并报告在结果里——如结果中 `staged.blocked` 非空，务必告知用户
+- 项目已有 `origin` 时默认拒绝推送，需要 `allow_existing_remote: true`（CLI 为 `--push-existing`）
+- 被 `.gitignore` 排除的 `dist/` 默认不发布，需要 `include_dist: true`（CLI 为 `--include-dist`）
+- tunnel 模式会在结果中注明实际执行的启动命令；对不受信任的项目，先向用户展示命令再执行
 
 ## Two entry points (same engine)
 
 1. **DSH 插件工具（本会话内）**：直接调 `deploy_public { project_dir, mode }`。`mode: "tunnel"`（默认）零账号、约 1 分钟出公网 URL；`mode: "permanent"` 走 GitHub+Render，未授权时返回 `awaiting_auth`（含 `user_code` + `verify_url`）——转达给用户，让用户浏览器打开并授权（永远不要向用户索要 token/密码），授权后再次调用同一参数即可继续。
-2. **独立 CLI（任何终端，无需 DSH）**：`npx dsh-deploy tunnel <dir>` / `dsh-deploy permanent <dir>` / `dsh-deploy doctor` / `dsh-deploy status` / `dsh-deploy stop all`。对"别人"交付时优先推荐 CLI（安装：`npm i -g dsh-deploy-public` 或从 GitHub Release 装 tgz）。
+2. **独立 CLI（任何终端，无需 DSH）**：`dsh-deploy tunnel <dir>` / `dsh-deploy permanent <dir>` / `dsh-deploy doctor` / `dsh-deploy status` / `dsh-deploy stop all`。对"别人"交付时优先推荐 CLI（安装：GitHub Release 下载 tgz 后 `npm i -g ./xxx.tgz`）。
 
 ## Workflow
 
