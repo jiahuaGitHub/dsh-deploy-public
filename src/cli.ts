@@ -41,12 +41,13 @@ function parseCommon(rest: string[]): { dir: string; port?: number; startCmd?: s
 
 async function cmdTunnel(rest: string[]): Promise<void> {
   const { dir, port, startCmd } = parseCommon(rest)
+  const portN = port ?? defaultPortOf(dir, 4173)
   const state = loadState()
-  if (state && pidAlive(state.server.pid) && state.projectDir === dir) {
-    console.log(`已存在部署：${state.tunnel?.url ?? '隧道建立中'}（dsh-deploy stop all 可先停掉）`)
+  // 服务与隧道都活着 → 直接复用
+  if (state && state.projectDir === dir && pidAlive(state.server.pid) && state.tunnel && pidAlive(state.tunnel.pid)) {
+    console.log(`已存在部署：${state.tunnel.url}（dsh-deploy stop all 可停掉）`)
     return
   }
-  const portN = port ?? defaultPortOf(dir, 4173)
   const scripts = readStartScript(dir)
   const cmdLine = startCmd ?? scripts.start ?? scripts.dev
   if (!cmdLine) {
@@ -54,17 +55,24 @@ async function cmdTunnel(rest: string[]): Promise<void> {
     process.exit(1)
   }
   const logDir = path.join(STATE_DIR, 'logs')
-  const serverLog = path.join(logDir, 'server.log')
-  const serverChild = spawnDetached(cmdLine, dir, serverLog, { PORT: String(portN) })
-  const serverPid = serverChild.pid
-  if (!serverPid) { console.error('✗ 服务启动失败'); process.exit(1) }
-  saveState({ projectDir: dir, port: portN, server: { pid: serverPid, startedAt: Date.now() } })
-  console.log(`[1/4] 服务已启动 pid=${serverPid} 日志=${serverLog}`)
+  // 服务不活（或状态缺失）→ 重建服务；否则复用现有服务只补隧道
+  let serverPid: number
+  if (state && state.projectDir === dir && pidAlive(state.server.pid)) {
+    serverPid = state.server.pid
+    console.log(`[1/4] 复用已运行服务 pid=${serverPid}`)
+  } else {
+    const serverLog = path.join(logDir, 'server.log')
+    const serverChild = spawnDetached(cmdLine, dir, serverLog, { PORT: String(portN) })
+    serverPid = serverChild.pid ?? 0
+    if (!serverPid) { console.error('✗ 服务启动失败'); process.exit(1) }
+    saveState({ projectDir: dir, port: portN, server: { pid: serverPid, startedAt: Date.now() } })
+    console.log(`[1/4] 服务已启动 pid=${serverPid} 日志=${serverLog}`)
+  }
 
   console.log('[2/4] 本地健康检查中…')
   const health = await waitHealthy(portN)
   if (!health.ok) {
-    console.error('✗ 健康检查失败: ' + health.detail + '\n服务日志尾部:\n' + tailFile(serverLog, 15))
+    console.error('✗ 健康检查失败: ' + health.detail + '\n服务日志尾部:\n' + tailFile(path.join(logDir, 'server.log'), 15))
     process.exit(1)
   }
   console.log(`    通过 ${health.detail}`)
@@ -139,7 +147,8 @@ function cmdStop(rest: string[]): void {
   if ((target === 'all' || target === 'tunnel') && st.tunnel) { killed.push('tunnel ' + killPidTree(st.tunnel.pid)) }
   if ((target === 'all' || target === 'server')) { killed.push('server ' + killPidTree(st.server.pid)) }
   clearState()
-  console.log('已停止: ' + killed.join('; ') || '无')
+  const detail = killed.join('; ')
+  console.log(detail ? '已停止: ' + detail : '已停止: 无')
 }
 
 async function cmdDoctor(rest: string[]): Promise<void> {

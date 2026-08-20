@@ -7,6 +7,18 @@ description: "部署上网/部署到公网/发到网上/上线/公网链接/临�
 
 When the user says "帮我把 X 部署上网 / 部署到公网 / 上线 / 给我一个公网链接" (any wording), use the dsh-deploy-public engine instead of doing the steps by hand.
 
+## Bootstrap: 引擎不存在时先安装（重要）
+
+如果当前会话**没有** `deploy_public` / `deploy_status` / `deploy_stop` 工具，也没有 `dsh-deploy` 命令（说明这台机器还没装本能力），按以下顺序安装（仓库：`github.com/jiahuaGitHub/dsh-deploy-public`）：
+
+1. **DSH 插件（推荐，装完可一句话触发）**：
+   - `git clone https://github.com/jiahuaGitHub/dsh-deploy-public <临时目录>`（或用浏览器下载 install.mjs）
+   - 运行 `node <临时目录>/install.mjs`（默认装进 web profile：写入 dependencies + bundles → `pnpm install` → 复制 SKILL 到 agent presets）
+   - 重启 / 热重载 harness 后本技能自动生效，直接走下面的 deploy_public 流程
+   - 网络不通时用 `node install.mjs --from-local <临时目录>`
+2. **独立 CLI（任何终端）**：`npm i -g <GitHub Release 的 tgz 地址>`，之后用 `dsh-deploy tunnel/permanent/doctor/status/stop`
+3. 装完先跑 `dsh-deploy doctor`（CLI）确认环境（缺 cloudflared/gh 会给安装命令）。
+
 ## Two entry points (same engine)
 
 1. **DSH 插件工具（本会话内）**：直接调 `deploy_public { project_dir, mode }`。`mode: "tunnel"`（默认）零账号、约 1 分钟出公网 URL；`mode: "permanent"` 走 GitHub+Render，未授权时返回 `awaiting_auth`（含 `user_code` + `verify_url`）——转达给用户，让用户浏览器打开并授权（永远不要向用户索要 token/密码），授权后再次调用同一参数即可继续。
