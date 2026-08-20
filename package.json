@@ -1,0 +1,35 @@
+{
+  "name": "@dsh-external/dsh-deploy-public",
+  "version": "0.1.0",
+  "description": "一句话把本地项目部署到公网：自动起服务 + cloudflared 隧道/ GitHub+Render 永久部署（插件 + 独立 CLI 双形态）",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "dsh-deploy": "lib/cli.js"
+  },
+  "main": "./lib/index.js",
+  "types": "./lib/types/index.d.ts",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "lib",
+    "SKILL.md",
+    "daemon.cjs"
+  ],
+  "license": "BSD-3-Clause",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.0-rc <5",
+    "@deepseek-ai/schemastery": "^3.18.0",
+    "@deepseek-ai/dsh-llm": ">=0.0.1-rc <2",
+    "@deepseek-ai/dsh-tools": ">=0.0.1-rc <2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.0"
+  },
+  "scripts": {
+    "build": "bash scripts/build.sh",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}
